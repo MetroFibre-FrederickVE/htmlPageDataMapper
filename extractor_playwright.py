@@ -47,9 +47,10 @@ async def capture_json_responses(page, url: str, timeout_sec: int = 25):
 
     console.print(f"[bold blue]Loading page...[/bold blue] {url}")
     try:
-        await page.goto(url, wait_until="networkidle", timeout=timeout_sec * 1000)
-        # Give extra time for late API calls (common on status pages)
-        await asyncio.sleep(6)
+        # Wait until network is idle and DOM is fully loaded
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_sec * 1000)
+        await page.wait_for_load_state("networkidle", timeout=timeout_sec * 1000)
+        await asyncio.sleep(3)  # Extra wait for React hydration
     except PlaywrightTimeout:
         console.print("[yellow]Timeout reached — partial load, checking captured data...[/yellow]")
     except Exception as e:
@@ -58,31 +59,64 @@ async def capture_json_responses(page, url: str, timeout_sec: int = 25):
 
     return json_responses
 
+# NEW: Extract window.nsData directly via JavaScript in browser
+async def extract_nsdata_from_window(page):
+    try:
+        # Try to get window.nsData
+        result = await page.evaluate("() => window.nsData")
+        if result:
+            console.print("[bold green]✅ Successfully extracted nsData from window![/bold green]")
+            return result
+        else:
+            console.print("[yellow]window.nsData is undefined[/yellow]")
+            return None
+    except Exception as e:
+        console.print(f"[red]Failed to evaluate window.nsData: {e}[/red]")
+        return None
+
 def suggest_filename(data, index: int, source_url: str = "") -> str:
-    """Smart filename guessing from JSON content"""
+    """Smart filename guessing"""
     if not isinstance(data, (dict, list)):
         return f"response_{index:03d}"
 
-    keys_lower = {k.lower(): k for k in data} if isinstance(data, dict) else {}
+    if isinstance(data, dict):
+        if "ftth" in data or "outages" in data or "maintenance" in data:
+            return "network_status"
+        if "statusTypes" in data or "areas" in data:
+            return "network_config"
 
-    priorities = [
-        "title", "name", "type", "status", "category", "outages", "faults",
-        "regions", "incidents", "network", "config", "data"
-    ]
+        keys_lower = {k.lower(): k for k in data}
+        priorities = [
+            "title", "name", "type", "status", "category", "outages", "faults",
+            "regions", "incidents", "network", "config", "data"
+        ]
 
-    for prio in priorities:
-        if prio in keys_lower:
-            value = data[keys_lower[prio]]
-            if isinstance(value, str) and 3 <= len(value) <= 45:
-                clean = "".join(c if c.isalnum() else "_" for c in value.lower().strip())
-                return clean.strip("_")
+        for prio in priorities:
+            if prio in keys_lower:
+                value = data[keys_lower[prio]]
+                if isinstance(value, str) and 3 <= len(value) <= 45:
+                    clean = "".join(c if c.isalnum() else "_" for c in value.lower().strip())
+                    return clean.strip("_")
 
-    # Fallback to domain + index
+        if "data" in data and isinstance(data["data"], dict):
+            return suggest_filename(data["data"], index)
+
     domain = urlparse(source_url).netloc.replace(".", "_")
     return f"{domain}_data_{index:03d}"
 
+def save_json_with_fallback(obj, path: Path, indent: int = 2):
+    try:
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=indent, ensure_ascii=False)
+        console.print(f"✓ Saved valid JSON: {path}")
+    except Exception as e:
+        partial_path = path.with_suffix(".partial.json")
+        with partial_path.open("w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=indent, ensure_ascii=False, default=str)
+        console.print(f"✗ Invalid JSON → saved as partial: {partial_path} ({e})")
+
 async def main():
-    parser = argparse.ArgumentParser(description="HtmlPageJsonExtractor (Playwright) - Capture JSON from dynamic pages")
+    parser = argparse.ArgumentParser(description="HtmlPageJsonExtractor (Playwright) - Extract nsData & network JSON")
     parser.add_argument("url", help="Target URL")
     parser.add_argument("--output-dir", "-o", default="./extracted", help="Where to save JSON files")
     parser.add_argument("--timeout", type=int, default=30, help="Page load timeout (seconds)")
@@ -102,53 +136,54 @@ async def main():
 
         captured = await capture_json_responses(page, args.url, args.timeout)
 
+        # Extract nsData from window
+        nsdata = await extract_nsdata_from_window(page)
+
         await browser.close()
 
-    if not captured:
+    # Combine results
+    all_json = captured
+    if nsdata:
+        all_json.append({
+            "url": args.url + " (window.nsData)",
+            "status": 200,
+            "size_bytes": len(json.dumps(nsdata)),
+            "data": nsdata,
+            "content_type": "application/json (window)"
+        })
+
+    if not all_json:
         console.print(Panel(
-            "[yellow]No JSON API responses captured.[/yellow]\n\n"
-            "Possible reasons:\n"
-            "• Data is rendered purely client-side without separate API calls\n"
-            "• Anti-bot protection\n"
-            "• Very late loading (>30s)\n\n"
-            "Next steps:\n"
-            "1. Increase --timeout\n"
-            "2. Try DOM extraction instead\n"
-            "3. Open devtools → Network tab and look for .json / api calls manually",
-            title="No Data Found", border_style="yellow"
+            "[red]No JSON data found.[/red]\n\n"
+            "Check if the page uses anti-bot protection or if nsData is loaded differently.",
+            title="No Data Found", border_style="red"
         ))
         return
 
-    console.print(f"\n[bold green]Captured {len(captured)} JSON responses![/bold green]\n")
+    console.print(f"\n[bold green]Extracted {len(all_json)} JSON object(s)![/bold green]\n")
 
-    for i, item in enumerate(captured, 1):
+    for i, item in enumerate(all_json, 1):
         data = item["data"]
         suggested = suggest_filename(data, i, item["url"])
 
         console.print(f"[bold]{i}.[/bold] {item['url']}")
         console.print(f"   Suggested name: [cyan]{suggested}.json[/cyan]")
-        console.print(f"   Size: {item['size_bytes']/1024:.1f} KB | Status: {item['status']}")
+        console.print(f"   Size: {item['size_bytes']/1024:.1f} KB")
 
         if args.interactive:
-            custom = console.input("   Custom name (Enter to accept suggested): ").strip()
+            custom = console.input("   Custom name (Enter to accept): ").strip()
             if custom:
                 suggested = "".join(c if c.isalnum() or c in "-_" else "_" for c in custom)
 
         filename = f"{suggested}.json"
         path = out_dir / filename
 
-        # Avoid overwrite
         counter = 1
         while path.exists():
             path = out_dir / f"{suggested}_{counter}.json"
             counter += 1
 
-        try:
-            with path.open("w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            console.print(f"   → Saved: [green]{path.name}[/green]\n")
-        except Exception as e:
-            console.print(f"   → Save failed: [red]{e}[/red]")
+        save_json_with_fallback(data, path)
 
 if __name__ == "__main__":
     asyncio.run(main())
