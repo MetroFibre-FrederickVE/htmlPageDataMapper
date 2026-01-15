@@ -23,3 +23,10 @@ python extractor_playwright.py https://example.com
 ```
 ## Output
 JSON files will be output into `{current_dir}/extracted/`
+
+## Example
+<img width="1108" height="328" alt="image" src="https://github.com/user-attachments/assets/03c4e667-f616-4ef9-b3c6-5c235fe9f23e" />
+
+#### Output
+<img width="1565" height="833" alt="image" src="https://github.com/user-attachments/assets/f0cf4a54-c849-4b5b-9ff9-5369d17ba290" />
+
